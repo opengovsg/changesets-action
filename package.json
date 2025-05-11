@@ -1,5 +1,5 @@
 {
-  "name": "@changesets/action",
+  "name": "@opengovsg/changesets-action",
   "version": "1.5.2",
   "main": "dist/index.js",
   "license": "MIT",
