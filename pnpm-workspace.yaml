@@ -20,6 +20,7 @@ minimumReleaseAgeExclude:
   - "@changesets/should-skip-package@1.0.0"
   - "@changesets/types@7.0.0"
   - "@changesets/write@1.0.0"
+  - "undici@6.29.1" # CVE-2026-109383 and CVE-2026-87018 fix, remove once older than minimumReleaseAge
   - "vite@8.2.0"
 
 overrides:
