@@ -1,0 +1,83 @@
+name: Publish
+
+on:
+  push:
+    branches:
+      - main
+      - next
+      - "maintenance/v*" # branch rulesets don't support v[0-9]+
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+  queue: max
+
+permissions: {} # each job should define its own permission explicitly
+
+jobs:
+  select-mode:
+    name: Select mode
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    outputs:
+      mode: ${{ steps.select-mode.outputs.mode }}
+    permissions:
+      contents: read # to check out repo (actions/checkout)
+    steps:
+      - uses: $/.github/actions/ci-setup
+        with:
+          skip-cache: true # avoid cache poisoning attacks
+
+      - name: Build
+        run: pnpm build
+
+      - name: Select mode
+        id: select-mode
+        uses: $/select-mode
+
+  version:
+    name: Version
+    if: needs.select-mode.outputs.mode == 'version'
+    needs: select-mode
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write # to create version commits (changesets/action)
+      pull-requests: write # to create pull request (changesets/action)
+    steps:
+      - uses: $/.github/actions/ci-setup
+        with:
+          skip-cache: true # avoid cache poisoning attacks
+
+      - name: Build
+        run: pnpm build
+
+      - name: Create or update release pull request
+        id: changesets
+        uses: $/version
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: pnpm bump
+
+  publish:
+    name: Publish
+    if: needs.select-mode.outputs.mode == 'publish'
+    needs: select-mode
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write # to push the tag and release line branch (release.ts) and create the release (changesets/action)
+    steps:
+      - uses: $/.github/actions/ci-setup
+        with:
+          skip-cache: true # avoid cache poisoning attacks
+
+      - name: Build
+        run: pnpm build
+
+      - name: Publish to marketplace
+        uses: $/publish
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: pnpm release

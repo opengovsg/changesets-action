@@ -1,10 +1,19 @@
-import unified from "unified";
-import remarkParse from "remark-parse";
-import remarkStringify from "remark-stringify";
-import type { Root } from "mdast";
-// @ts-ignore
-import mdastToString from "mdast-util-to-string";
-import { getPackages, Package } from "@manypkg/get-packages";
+import fs from "node:fs/promises";
+import { createRequire } from "node:module";
+import path from "node:path";
+import artifact from "@actions/artifact";
+import * as core from "@actions/core";
+import {
+  exec,
+  getExecOutput,
+  type ExecOptions as ActionsExecOptions,
+  type ExecOutput,
+} from "@actions/exec";
+import { getPackages, type Package } from "@manypkg/get-packages";
+import major from "semver/functions/major.js";
+import subset from "semver/ranges/subset.js";
+
+const require = createRequire(import.meta.url);
 
 export const BumpLevels = {
   dep: 0,
@@ -20,7 +29,7 @@ export async function getVersionsByDirectory(cwd: string) {
 
 export async function getChangedPackages(
   cwd: string,
-  previousVersions: Map<string, string>
+  previousVersions: Map<string, string>,
 ) {
   let { packages } = await getPackages(cwd);
   let changedPackages = new Set<Package>();
@@ -36,57 +45,61 @@ export async function getChangedPackages(
 }
 
 export function getChangelogEntry(changelog: string, version: string) {
-  let ast = unified().use(remarkParse).parse(changelog) as Root;
-
   let highestLevel: number = BumpLevels.dep;
-
-  let nodes = ast.children;
-  let headingStartInfo:
-    | {
-        index: number;
-        depth: number;
-      }
-    | undefined;
+  let headingStartInfo: { index: number; depth: number } | undefined;
   let endIndex: number | undefined;
 
-  for (let i = 0; i < nodes.length; i++) {
-    let node = nodes[i];
-    if (node.type === "heading") {
-      let stringified: string = mdastToString(node);
-      let match = stringified.toLowerCase().match(/(major|minor|patch)/);
-      if (match !== null) {
-        let level = BumpLevels[match[0] as "major" | "minor" | "patch"];
-        highestLevel = Math.max(level, highestLevel);
-      }
-      if (headingStartInfo === undefined && stringified === version) {
-        headingStartInfo = {
-          index: i,
-          depth: node.depth,
-        };
+  // Iterate through each headings and code blocks (for skipping its contents)
+  const regex = /^(#{1,6})\s(.*)$|^(`{3,})/gm;
+  let match: RegExpExecArray | null;
+  while ((match = regex.exec(changelog)) != null) {
+    // Skip over code blocks so we don't match any headings inside of them
+    if (match[3]) {
+      const endOfCodeBlockRegex = new RegExp(`^${match[3]}`, "gm");
+      endOfCodeBlockRegex.lastIndex = regex.lastIndex;
+      const endMatch = endOfCodeBlockRegex.exec(changelog);
+      if (endMatch) {
+        // Start next search for headings after the end of the code block
+        regex.lastIndex = endOfCodeBlockRegex.lastIndex;
         continue;
-      }
-      if (
-        endIndex === undefined &&
-        headingStartInfo !== undefined &&
-        headingStartInfo.depth === node.depth
-      ) {
-        endIndex = i;
+      } else {
+        // Can't find end of code block, probably malformed
         break;
       }
     }
+
+    const headingDepth = match[1].length;
+    const headingText = match[2].trim();
+
+    // Search for the highest bump level in the entire changelog
+    const levelMatch = /(major|minor|patch)/.exec(headingText.toLowerCase());
+    if (levelMatch != null) {
+      const level = BumpLevels[levelMatch[0] as "major" | "minor" | "patch"];
+      highestLevel = Math.max(level, highestLevel);
+    }
+
+    // Search for heading of the entry
+    if (headingText === version) {
+      headingStartInfo = { index: regex.lastIndex, depth: headingDepth };
+      continue;
+    }
+
+    // If we've found the entry heading, search for the closing heading with the same depth
+    if (headingStartInfo && headingDepth === headingStartInfo.depth) {
+      endIndex = match.index;
+      break;
+    }
   }
-  if (headingStartInfo) {
-    ast.children = ast.children.slice(headingStartInfo.index + 1, endIndex);
-  }
+
   return {
-    content: unified().use(remarkStringify).stringify(ast),
-    highestLevel: highestLevel,
+    content: changelog.slice(headingStartInfo?.index, endIndex).trim(),
+    highestLevel,
   };
 }
 
 export function sortTheThings(
   a: { private: boolean; highestLevel: number },
-  b: { private: boolean; highestLevel: number }
+  b: { private: boolean; highestLevel: number },
 ) {
   if (a.private === b.private) {
     return b.highestLevel - a.highestLevel;
@@ -104,4 +117,170 @@ export function isErrorWithCode(err: unknown, code: string) {
     "code" in err &&
     err.code === code
   );
+}
+
+export type WithAsyncDispose<T> = T & {
+  [Symbol.asyncDispose](): Promise<void>;
+};
+
+export function moveDisposable<T extends object>(
+  stack: AsyncDisposableStack,
+  value: T,
+): WithAsyncDispose<T> {
+  const moved = stack.move();
+  return Object.assign(value, {
+    async [Symbol.asyncDispose]() {
+      await moved.disposeAsync();
+    },
+  });
+}
+
+export function getOptionalInput(name: string) {
+  // normalize empty string default return value of `core.getInput` to undefined
+  return core.getInput(name) || undefined;
+}
+
+export function getRequiredInput(name: string) {
+  // it's just a small utility wrapper, mainly introduced for usage parity with our custom `getOptionalInput`
+  // note: `core.getBooleanInput` gets used directly as it already normalizes the return value nicely
+  return core.getInput(name, { required: true });
+}
+
+export function throwOnRemovedCommitModeInput() {
+  for (const inputName of ["commit-mode", "commitMode"]) {
+    const value = getOptionalInput(inputName);
+    if (value === undefined) continue;
+
+    const migration =
+      value === "git-cli"
+        ? 'Replace it with "push-with-git-cli: true".'
+        : value === "github-api"
+          ? 'Remove it or replace it with "push-with-git-cli: false"; GitHub API pushes are now the default.'
+          : 'Set "push-with-git-cli" to true for Git CLI pushes or false for GitHub API pushes.';
+    throw new Error(
+      `The "${inputName}" input has been replaced by the boolean "push-with-git-cli" input. ${migration}`,
+    );
+  }
+}
+
+export function throwOnRenamedInputs(renames: Record<string, string>) {
+  const references: Record<string, string> = {};
+
+  for (const [oldInput, newInput] of Object.entries(renames)) {
+    if (core.getInput(oldInput)) {
+      references[oldInput] = newInput;
+    }
+  }
+
+  if (Object.keys(references).length > 0) {
+    const list = Object.entries(references)
+      .map(([oldInput, newInput]) => `- "${oldInput}" -> "${newInput}"`)
+      .join("\n");
+    throw new Error(
+      `The following inputs have been renamed:\n${list}\nPlease update your workflow file.`,
+    );
+  }
+}
+
+const changesetsCliCompatibilityError =
+  "This version of the Changesets action is designed to work with Changesets CLI v3. " +
+  "Changesets CLI v2 is not supported; use Changesets action v1 instead, which is compatible with CLI v2.";
+
+export async function validateChangesetsCliVersion(cwd: string) {
+  const { rootPackage } = await getPackages(cwd);
+  const packageJson = rootPackage?.packageJson;
+  const declaredVersion =
+    packageJson?.devDependencies?.["@changesets/cli"] ??
+    packageJson?.dependencies?.["@changesets/cli"];
+
+  if (typeof declaredVersion === "string") {
+    const range = declaredVersion.startsWith("workspace:")
+      ? declaredVersion.slice("workspace:".length)
+      : declaredVersion;
+
+    let isV2 = false;
+
+    try {
+      isV2 = subset(range, ">=2.0.0-0 <3.0.0-0", {
+        includePrerelease: true,
+      });
+    } catch {
+      // it could be a non-semver protocol
+    }
+
+    if (isV2) {
+      throw new Error(changesetsCliCompatibilityError);
+    }
+  }
+
+  let cliPackageJson;
+
+  try {
+    cliPackageJson = require(
+      require.resolve("@changesets/cli/package.json", { paths: [cwd] }),
+    );
+  } catch {
+    return;
+  }
+
+  if (
+    typeof cliPackageJson.version === "string" &&
+    major(cliPackageJson.version) === 2
+  ) {
+    throw new Error(changesetsCliCompatibilityError);
+  }
+}
+
+function resolveChangesetsCli(cwd: string) {
+  return require.resolve("@changesets/cli/bin.js", {
+    paths: [cwd],
+  });
+}
+
+interface ExecOptions extends Omit<ActionsExecOptions, "env"> {
+  env?: Record<string, string | undefined>;
+}
+
+export function execChangesetsCli(args: string[], options?: ExecOptions) {
+  return exec(
+    "node",
+    [resolveChangesetsCli(options?.cwd ?? process.cwd()), ...args],
+    options as ActionsExecOptions,
+  );
+}
+
+export function getExecOutputChangesetsCli(
+  args: string[],
+  options?: ExecOptions,
+): Promise<ExecOutput> {
+  return getExecOutput(
+    "node",
+    [resolveChangesetsCli(options?.cwd ?? process.cwd()), ...args],
+    options as ActionsExecOptions,
+  );
+}
+
+export async function downloadArtifact(
+  tmpDir: string,
+  artifactId: number,
+  name: string,
+) {
+  if (!Number.isInteger(artifactId) || artifactId <= 0) {
+    throw new Error(
+      `Invalid ${JSON.stringify(name)} artifact id: ${artifactId}`,
+    );
+  }
+
+  const downloadPath = path.join(tmpDir, `${name}-${artifactId}-${Date.now()}`);
+  const result = await artifact.downloadArtifact(artifactId, {
+    path: downloadPath,
+  });
+
+  if (!result.downloadPath) {
+    throw new Error(
+      `${JSON.stringify(name)} artifact download did not return a path for artifact ${artifactId}`,
+    );
+  }
+
+  return result.downloadPath;
 }
